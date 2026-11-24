@@ -1,0 +1,29 @@
+ISTART = 0
+
+ENCUT = 400
+POTIM = 0.5
+EDIFF = 1E-6
+GGA = RP
+
+IBRION = 0
+MDALGO=2
+! LANGEVIN_GAMMA = 0.25 0.25
+SMASS = 0.40473034365811045
+TEBEG = 550
+TEEND = 550
+ISMEAR = 0
+ISIF = 2
+ALGO = Fast
+
+NELM = 300
+NSW = 200
+VELOCITY=T
+ISYM = 0
+SIGMA  = 0.1      ! smearing in eV
+LREAL  = Auto     ! projection operators in real space
+
+LWAVE = .FALSE.
+LCHARG = .FALSE.
+! KPAR = 2
+
+PLUGINS/FORCE_AND_STRESS = T        ! Modifies the force and stress at the end of the SCF loop
