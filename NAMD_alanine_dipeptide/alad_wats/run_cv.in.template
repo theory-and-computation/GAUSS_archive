@@ -1,0 +1,29 @@
+colvarsTrajFrequency 1
+colvarsRestartFrequency 4500
+scriptedColvarForces on
+
+colvar {
+    name phi
+    dihedral {
+        onesiteTotalForce
+        group1 { atomNumbers { 5 } }
+        group2 { atomNumbers { 7 } }
+        group3 { atomNumbers { 9 } }
+        group4 { atomNumbers { 15 } }
+    }
+    outputAppliedForce
+    outputTotalForce
+}
+
+colvar {
+    name psi
+    dihedral {
+        onesiteTotalForce
+        group1 { atomNumbers { 17 } }
+        group2 { atomNumbers { 15 } }
+        group3 { atomNumbers { 9 } }
+        group4 { atomNumbers { 7 } }
+    }
+    outputAppliedForce
+    outputTotalForce
+}
