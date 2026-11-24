@@ -1,177 +1,231 @@
+"""
+NAMD Simulation Engine Interface.
+
+This module provides the `NAMD` wrapper class to:
+1. Execute NAMD MD trajectories and post-process coordinates/velocities.
+2. Read trajectory data from Colvars output files.
+3. Compute CV Jacobians via automatic differentiation (JAX).
+4. Compute generalized conjugate atomic momenta along CV degrees of freedom.
+"""
+
+from __future__ import annotations
+
 import os
-import numpy as np
-import pandas as pd
-import torch
+from pathlib import Path
+import shutil
+import subprocess
+from typing import TYPE_CHECKING, Tuple
+
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pandas as pd
+
 from alad_wats.extr_cv_coor import extract_cv_coor
+
+if TYPE_CHECKING:
+    import logger as modular_log
+
+# Configurable VMD binary path via environment variable with a standard fallback
+VMD_EXEC = os.getenv("VMD_EXEC", "vmd")
 
 
 class NAMD:
+    """Wrapper interface for running NAMD simulations and extracting ABF observables.
 
-    def __init__(self, cv1, cv2):
-        self.cv1 = cv1
-        self.cv2 = cv2
-        self.unit_scalar = 2390.06 
+    Parameters
+    ----------
+    cv1 : str
+        Name/type of first collective variable (e.g., 'dihedral').
+    cv2 : str
+        Name/type of second collective variable (e.g., 'dihedral').
+    """
 
-    def runner(self, logger):
-        """This function runs NAMD from the command line"""
-        from pathlib import Path
-        print(f"{logger.iter} running namd")
-        dirtag = Path(logger.dirtag).resolve()
-        job = format(logger.iter, '05d')
-        # job_path = '/dfs7/elizaml4/dkamp/poly_catal/enhanced_sampling/4_gpr/4_namd/'+logger.dirtag
-        # job_path = f'{logger.dirtag}'
-        job_path = str(dirtag)
-        # root = f'{logger.dirtag}/alad_wats/'
-        root = dirtag / "alad_wats"
+    def __init__(self, cv1: str, cv2: str):
+        self.cv1: str = cv1
+        self.cv2: str = cv2
+        # Unit conversion scalar from internal NAMD/Charmm units to kcal/(mol*deg) or equivalent
+        self.unit_scalar: float = 2390.06
 
-        # os.system(f"sed -i 's/^export jobstep=.*/export jobstep={job}/' exe.sh")
-        
-        if logger.iter != 0:
-            os.system(f"bash {root}/run_exe.sh {job} {job_path}")
-        else:
-            os.system(f"bash {root}/eq_exe.sh {job} {job_path}")
+    def runner(self, logger: modular_log.Logger) -> None:
+        """Execute NAMD MD simulation and invoke coordinate/velocity extraction scripts.
 
-        # os.system(f"bash {root}/run_exe.sh {job} {job_path}")
+        Parameters
+        ----------
+        logger : modular_log.Logger
+            Active simulation state logger.
+        """
+        print(f"Iteration {logger.iter}: Running NAMD MD engine...", flush=True)
 
-        print(f"{logger.iter} finished running NAMD")
-        extract_cv_coor(root, job, job_path)  # write out the coordinated for each cv
-        os.system(f"/dfs7/elizaml4/sinail/vmd/vmd-1.9.4a57/bin/vmd -dispdev text -e {logger.dirtag}/alad_wats/get_vel.tcl -args {root} {job} {job_path}")
+        job_str = f"{logger.iter:05d}"
+        run_dir = Path(logger.dirtag).resolve()
+        script_dir = run_dir / "alad_wats"
 
-    
-    def collect_data(self, logger): 
-        """This function collects NAMD data and formats for ABF"""
-        job = format(logger.iter, '05d')
-        colv_traj_file = str(job)+'.colvars.traj'
-        cv_coord_file = str(job)+'.cv_coor.txt'
-        job_path = '/dfs7/elizaml4/dkamp/poly_catal/enhanced_sampling/4_gpr/7_gauss_revisions_namd_gpr/'+logger.dirtag
-        
-        print(f"{logger.iter} calculating jacobians")
-        jxi = self.calc_jac(job, logger, job_path)
-        
-        print(f"{logger.iter} calculating momentums")
-        p = self.calc_mom(job, job_path)
+        # Execute MD run script: eq_exe.sh for step 0, run_exe.sh for subsequent iterations
+        exe_script = script_dir / ("run_exe.sh" if logger.iter != 0 else "eq_exe.sh")
+        subprocess.run(["bash", str(exe_script), job_str, str(run_dir)], check=True)
 
-        print(f"{logger.iter} grabbing cvs")
-        cv1, cv2, f_applied1, f_applied2 = self.grab_cvs(job, job_path)
-       
-        import glob
-        import shutil
+        print(f"Iteration {logger.iter}: NAMD execution complete. Extracting CV coordinates...", flush=True)
+        extract_cv_coor(str(script_dir), job_str, str(run_dir))
+
+        # Extract velocities using VMD script
+        vmd_script = script_dir / "get_vel.tcl"
+        subprocess.run(
+            [
+                VMD_EXEC,
+                "-dispdev", "text",
+                "-e", str(vmd_script),
+                "-args", str(script_dir), job_str, str(run_dir),
+            ],
+            check=True,
+        )
+
+    def collect_data(
+        self, logger: modular_log.Logger
+    ) -> Tuple[jnp.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+        """Gather CV values, applied forces, Jacobians, and conjugate momenta.
+
+        Parameters
+        ----------
+        logger : modular_log.Logger
+            Active simulation state logger.
+
+        Returns
+        -------
+        jxi : jnp.ndarray
+            Jacobian matrices along the trajectory, shape (N_steps, 2, 24).
+        p : np.ndarray
+            Conjugate momentum vectors along the trajectory, shape (N_steps, 24, 1).
+        cv1, cv2 : np.ndarray
+            Instantaneous values of the collective variables.
+        f_applied1, f_applied2 : np.ndarray or None
+            Biasing forces applied by the colvars module (None during equilibration).
+        """
+        job_str = f"{logger.iter:05d}"
+        job_path = Path(logger.dirtag).resolve()
+
+        print(f"Iteration {logger.iter}: Evaluating CV Jacobians via JAX...", flush=True)
+        jxi = self.calc_jac(job_str, logger, str(job_path))
+
+        print(f"Iteration {logger.iter}: Calculating conjugate atomic momenta...", flush=True)
+        p = self.calc_mom(job_str, str(job_path))
+
+        print(f"Iteration {logger.iter}: Loading trajectory CVs and applied forces...", flush=True)
+        cv1, cv2, f_applied1, f_applied2 = self.grab_cvs(job_str, str(job_path))
+
+        # Disk cleanup: delete output directories from 2 iterations ago to save quota
         if logger.iter > 1:
-            prevprev_job = format(logger.iter-2, '05d')
-            output_dir = os.path.join(job_path, 'output', prevprev_job)
-            keep_files = [] 
-            if os.path.isdir(output_dir):
-                for root, dirs, files in os.walk(output_dir):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if file_path not in keep_files:
-                            try:
-                                os.remove(file_path)
-                            except Exception as e:
-                                print(f'Could not delete {file_path}: {e}')
-
+            prev_job_str = f"{logger.iter - 2:05d}"
+            old_output_dir = job_path / "output" / prev_job_str
+            if old_output_dir.is_dir():
+                try:
+                    shutil.rmtree(old_output_dir)
+                except OSError as e:
+                    print(f"Warning: Could not remove old output directory {old_output_dir}: {e}")
 
         return jxi, p, cv1, cv2, f_applied1, f_applied2
 
-
     @staticmethod
-    def grab_cvs(job, job_path):
+    def grab_cvs(
+        job: str, job_path: str
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+        """Read collective variable coordinates and applied bias forces from Colvars trajectory."""
+        traj_file = Path(job_path) / "output" / job / f"{job}.colvars.traj"
+        df = pd.read_csv(traj_file, sep=r"\s+", comment="#", header=None)
 
-        cv1, cv2 = 'phi', 'psi'
+        cv1_vals = df[df.columns[1]].to_numpy()
+        cv2_vals = df[df.columns[4]].to_numpy()
 
         if int(job) == 0:
-            df = pd.read_csv(
-            f"{job_path}/output/{job}/{job}.colvars.traj",
-            sep='\s+',
-            comment="#",
-            header=None,)
-            return df[df.columns[1]].to_numpy(), df[df.columns[4]].to_numpy(), None, None
-        else:
-            df = pd.read_csv(
-            f"{job_path}/output/{job}/{job}.colvars.traj",
-            sep='\s+',
-            comment="#",
-            header=None)
-            return  df[df.columns[1]].to_numpy(), df[df.columns[4]].to_numpy(), df[df.columns[3]].to_numpy(), df[df.columns[6]].to_numpy()
+            return cv1_vals, cv2_vals, None, None
 
+        f_applied1 = df[df.columns[3]].to_numpy()
+        f_applied2 = df[df.columns[6]].to_numpy()
+        return cv1_vals, cv2_vals, f_applied1, f_applied2
 
     @staticmethod
-    def calc_mom(job, job_path):
-        """calculate the momentums at every timestep from the NAMD data"""
-        # mom1, mom2 = [], []
-        
-        df1 = pd.read_csv(f"{job_path}/output/{job}/{job}.cv1_vel.dat", sep=r"\s+")
-        df2 = pd.read_csv(f"{job_path}/output/{job}/{job}.cv2_vel.dat", sep=r"\s+")
+    def calc_mom(job: str, job_path: str) -> np.ndarray:
+        """Compute atomic momenta from velocity logs and atomic masses.
+
+        Returns
+        -------
+        np.ndarray
+            Momenta array of shape (N_steps, 24, 1) in units of A*amu/fs.
+        """
+        output_dir = Path(job_path) / "output" / job
+        df1 = pd.read_csv(output_dir / f"{job}.cv1_vel.dat", sep=r"\s+")
+        df2 = pd.read_csv(output_dir / f"{job}.cv2_vel.dat", sep=r"\s+")
+
         natoms = {
-            "cv2": ['006', '008', '014', '016'],
-            "cv1": ['004', '006', '008', '014']}
-        
-        def get_velocities(df, cv):
+            "cv1": ["004", "006", "008", "014"],
+            "cv2": ["006", "008", "014", "016"],
+        }
+
+        # Conversion factor for NAMD velocity units to internal momentum units
+        vel_scale = np.float32(0.0204548)
+
+        def _extract_velocities(df: pd.DataFrame, cv_key: str) -> np.ndarray:
             cols = []
-            for a in natoms[cv]:
-                cols.extend([f'{{atom_{a}_vx}}', f'{{atom_{a}_vy}}', f'{{atom_{a}_vz}}'])
-            # Convert directly to float32 to save memory
+            for atom_id in natoms[cv_key]:
+                cols.extend([f"{{atom_{atom_id}_vx}}", f"{{atom_{atom_id}_vy}}", f"{{atom_{atom_id}_vz}}"])
             return df[cols].to_numpy(dtype=np.float32)
 
-            # shape: (nsteps, 12), float32
-        vels_cv1 = get_velocities(df1, "cv1") * np.float32(0.0204548)
-        vels_cv2 = get_velocities(df2, "cv2") * np.float32(0.0204548)
+        vels_cv1 = _extract_velocities(df1, "cv1") * vel_scale
+        vels_cv2 = _extract_velocities(df2, "cv2") * vel_scale
+        vels_all = np.hstack([vels_cv1, vels_cv2])  # Shape: (N_steps, 24)
 
-        # (nsteps, 24) velocities
-        vels_all = np.hstack([vels_cv1, vels_cv2])  # float32
+        # Atomic masses for each atom coordinate (C: 12.01, N: 14.0)
+        mass_cv1 = [12.01, 12.01, 12.01, 14.00, 14.00, 14.00, 12.01, 12.01, 12.01, 12.01, 12.01, 12.01]
+        mass_cv2 = [14.00, 14.00, 14.00, 12.01, 12.01, 12.01, 12.01, 12.01, 12.01, 14.00, 14.00, 14.00]
+        mass_all = np.array(mass_cv1 + mass_cv2, dtype=np.float32)
 
-        # masses, broadcast over steps
-        mass1 = np.array([12.01, 12.01, 12.01, 14, 14, 14, 12.01, 12.01, 12.01, 12.01, 12.01, 12.01],
-                        dtype=np.float32)
-        mass2 = np.array([14, 14, 14, 12.01, 12.01, 12.01, 12.01, 12.01, 12.01, 14, 14, 14],
-                        dtype=np.float32)
-        
-        
-        moms = []
-        for step in vels_all:
-            mom1 = step[:12]*mass1  # cv1 moms
-            mom2 = step[12:]*mass2  # cv2 moms
-            mom_tot = np.concatenate((mom1, mom2)).reshape(-1, 1)
-            moms.append(mom_tot)
-
-        return np.array(moms)
+        # Vectorized momentum calculation: p = m * v
+        moms_all = vels_all * mass_all[None, :]  # Shape: (N_steps, 24)
+        return moms_all[:, :, None]              # Reshape to (N_steps, 24, 1)
 
     @staticmethod
-    def calc_jac(job, logger, job_path):
-        """calculates the jacobian matrix at every timestep in the NAMD simulation"""
+    def calc_jac(job: str, logger: modular_log.Logger, job_path: str) -> jnp.ndarray:
+        """Compute the Jacobian of collective variables with respect to Cartesian coordinates."""
+        output_dir = Path(job_path) / "output" / job
+        df_cv1 = pd.read_csv(output_dir / f"{job}.cv1_coor.dat", sep=r"\s+")
+        df_cv2 = pd.read_csv(output_dir / f"{job}.cv2_coor.dat", sep=r"\s+")
 
-        natoms = {"cv2": ['006', '008', '014', '016'], "cv1": ['004', '006', '008', '014']}
-        df_cv1 = pd.read_csv(f'{job_path}/output/{job}/{job}.cv1_coor.dat', sep='\s+')  # cv1
-        df_cv2 = pd.read_csv(f'{job_path}/output/{job}/{job}.cv2_coor.dat', sep='\s+')  # cv2
-        
+        natoms = {
+            "cv1": ["004", "006", "008", "014"],
+            "cv2": ["006", "008", "014", "016"],
+        }
+
         atoms_cv1 = jnp.stack(
-        [df_cv1[[f'{{atom_{a}_x}}', f'{{atom_{a}_y}}', f'{{atom_{a}_z}}']].to_numpy() for a in natoms['cv1']],
-        axis=1)
+            [df_cv1[[f"{{atom_{a}_x}}", f"{{atom_{a}_y}}", f"{{atom_{a}_z}}"]].to_numpy() for a in natoms["cv1"]],
+            axis=1,
+        )
         atoms_cv2 = jnp.stack(
-        [df_cv2[[f'{{atom_{a}_x}}', f'{{atom_{a}_y}}', f'{{atom_{a}_z}}']].to_numpy() for a in natoms['cv2']],
-        axis=1)
+            [df_cv2[[f"{{atom_{a}_x}}", f"{{atom_{a}_y}}", f"{{atom_{a}_z}}"]].to_numpy() for a in natoms["cv2 daylight" if "cv2 daylight" in natoms else "cv2"]],
+            axis=1,
+        )
 
-        # flattened jacobian for jnp
-        def flat_jac(atoms, cv_type):
-            cv_fn = logger.cv_function(cv_type)   # get the CV function
-            jac = jax.jacrev(cv_fn)(atoms)        # evaluate Jacobian at atoms
-            return jac.ravel() 
-        
-        # vectorize both
+        def flat_jac(atom_coords, cv_type: str):
+            cv_func = logger.cv_function(cv_type)
+            jac = jax.jacrev(cv_func)(atom_coords)
+            return jac.ravel()
+
+        # Vectorized reverse-mode automatic differentiation over the trajectory
         vmap_jac_cv1 = jax.vmap(lambda a: flat_jac(a, logger.cv1))
         vmap_jac_cv2 = jax.vmap(lambda a: flat_jac(a, logger.cv2))
 
-        # evaluate
         jac_cv1 = vmap_jac_cv1(atoms_cv1)
         jac_cv2 = vmap_jac_cv2(atoms_cv2)
 
-        # pad with zeros so cv1 & cv2 sit in separate blocks
+        # Assemble into block-diagonal structure for 2D collective variables
         zeros1 = jnp.zeros_like(jac_cv1)
         zeros2 = jnp.zeros_like(jac_cv2)
 
-        jacs_all_steps = jnp.stack([jnp.concatenate([jac_cv1, zeros2], axis=-1),   # cv1 in left block
-                jnp.concatenate([zeros1, jac_cv2], axis=-1)], axis=1)
+        jacs_all_steps = jnp.stack(
+            [
+                jnp.concatenate([jac_cv1, zeros2], axis=-1),
+                jnp.concatenate([zeros1, jac_cv2], axis=-1),
+            ],
+            axis=1,
+        )
 
         return jnp.array(jacs_all_steps)
