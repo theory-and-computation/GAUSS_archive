@@ -1,9 +1,7 @@
-# ABF + GP Force Benchmark (1D / 2D Langevin MD)
+# GAUSS work flow on model potentials (1D / 2D Langevin dynamics)
 
-Adaptive Biasing Force on a double-Gaussian model potential, where the bias
-potential is learned by a Gaussian Process trained on per-bin ABF mean forces.
-The benchmark's goal: recover the model free energy A(x) and compare it
-against the analytic reference.
+This repository provides a workflow for GAUSS, an enhanced sampling method that uses molecular dynamics simulations with Bayesian inference based on Gaussian Process Regression (GPR) to compute the free energy surface using an iterative biasing scheme.
+Goal of using double Gaussian well potentials with Langevin dynamics: To recover the model free energy A(x) and compare it against an exact analytical free energy function.
 
 ## Files
 
