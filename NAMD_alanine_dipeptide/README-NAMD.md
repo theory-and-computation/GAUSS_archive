@@ -1,6 +1,6 @@
 # GAUSS implementation in NAMD with solvated alanine dipeptide
 
-This repository provides a workflow for GAUSS, an enhanced sampling method that uses molecular dynamics simulations (e.g., NAMD and VASP) with Bayesian inference based on Gaussian Process Regression (GPR) to compute the free energy surface using an iterative biasing scheme. The framework models the free-energy surface (FES) and its gradient field directly from observed mean forces (Adaptive Biasing Force / ABF formulation) and incorporates an uncertainty-driven exploration bias.
+This repository provides a workflow for GAUSS, an enhanced sampling method that uses molecular dynamics simulations (e.g., NAMD and VASP) with Bayesian inference based on Gaussian Process Regression (GPR) to compute the free energy surface using an iterative biasing scheme. The framework models the free-energy surface (FES) and its gradient field directly from observed mean forces and incorporates an uncertainty-driven exploration bias.
 
 ---
 
